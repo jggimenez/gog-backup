@@ -16,9 +16,9 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Usage: %s [--version] [--help] <command> [<args>]
+"""Usage: %prog [options] <command> [<args>]
 
-Possible commands:
+Commands:
 
   login <email> <password>
     Login to GOG.com using the supplied email and password.
@@ -45,10 +45,11 @@ __author__ = 'Evan Powers'
 __version__ = '1.0'
 __url__ = 'https://github.com/evanpowers/gog-backup'
 
-import sys, os, contextlib, pprint, hashlib, zipfile
+import sys, os, optparse, contextlib, pprint, hashlib, zipfile
 import cookielib, urllib, urllib2, urlparse
 import xml.etree.ElementTree
 import threading, Queue, time
+import StringIO, traceback
 
 import html5lib  # http://code.google.com/p/html5lib/
 
@@ -72,9 +73,13 @@ cookieproc = urllib2.HTTPCookieProcessor(cookiejar)
 opener = urllib2.build_opener(cookieproc)
 treebuilder = html5lib.treebuilders.getTreeBuilder('etree')
 parser = html5lib.HTMLParser(tree=treebuilder, namespaceHTMLElements=False)
+debuglog = None
 
 useragent = 'gog-backup/%s (%s)' % (__version__, __url__)
 opener.addheaders = [('User-agent', useragent)]
+
+class DebugPage(Exception):
+    pass
 
 class AttrDict(dict):
     def __init__(self, **kw):
@@ -84,7 +89,68 @@ class AttrDict(dict):
     def __setattr__(self, key, val):
         self[key] = val
 
-def request(url, args=None, range=None, hide=False):
+class Page(AttrDict):
+    def read(self, size):
+        if not hasattr(self.page, 'read'):
+            raise DebugPage(self.url)
+        return self.page.read(size)
+    def close(self):
+        if hasattr(self.page, 'close'):
+            self.page.close()
+
+def debug_load(fn):
+    log, _ = debuglog
+    with zipfile.ZipFile(fn, 'r') as r:
+        with r.open('log.py', 'rU') as log_:
+            log_ = eval(log_.read())
+        for dbk, pg in log_:
+            if isinstance(pg, dict):
+                pg = Page(**pg)
+                if isinstance(pg.page, str):
+                    pg.page = r.read(pg.page)
+                assert dbk not in log
+                log[dbk] = pg
+
+def debug(code, *args, **kw):
+    if not debuglog:
+        return Page()
+    log, fn = debuglog
+    dbk = tuple([code] + sorted(kw.items()))
+    if fn:
+        if args:
+            assert not kw
+            pg = args
+        else:
+            pg = Page(**kw)
+        log.append((dbk, pg))
+        return pg
+    else:
+        if args:
+            if code == 'TRACEBACK':
+                import pdb
+                pdb.post_mortem()
+            return
+        else:
+            return log[dbk]
+
+def debug_save():
+    if not debuglog:
+        return
+    log, fn = debuglog
+    if not fn:
+        return
+    with zipfile.ZipFile(fn, 'w') as w:
+        for i, (dbk, pg) in enumerate(log):
+            if isinstance(pg, Page):
+                if isinstance(pg.page, str):
+                    i = '%d.txt' % i
+                    w.writestr(i, pg.page)
+                    pg.page = i
+                else:
+                    pg.page = True
+        w.writestr('log.py', pprint.pformat(log))
+
+def _request(pg, url, args, range, hide):
     if not hide:
         print '>', url,
         sys.stdout.flush()
@@ -93,14 +159,39 @@ def request(url, args=None, range=None, hide=False):
     req = urllib2.Request(url, data=args)
     if range is not None:
         req.add_header('Range', 'bytes=%d-%d' % range)
-    page = opener.open(req)
+    pg.page = opener.open(req)
+    pg.url_before = req.get_full_url()
+    pg.url_after = pg.page.geturl()
+    pg.code = pg.page.getcode()
+    if range is not None:
+        pg.content_range = pg.page.headers['Content-Range']
+    pg.headers = dict((k, v) for k, v in pg.page.headers.items()
+                      if k != 'set-cookie')  # (only for debug)
     if not hide:
-        print '[%d]' % page.getcode()
-    assert 200 <= page.getcode() < 300
-    if page.geturl().endswith('/login') and url != LOGIN:
+        print '[%d]' % pg.code
+    assert 200 <= pg.code < 300
+    if pg.url_after.endswith('/login') and url != LOGIN:
         # must have been redirected to a login page
         raise RuntimeError('login required')
-    return contextlib.closing(page)
+
+def request(url, args=None, html=True, hide=False):
+    pg = debug('REQUEST', url=url, args=args, html=html)
+    if not hasattr(pg, 'page'):
+        _request(pg, url, args, None, hide)
+        with contextlib.closing(pg.page) as page:
+            pg.page = page.read()
+    if html:
+        etree = parser.parse(pg.page)
+    else:
+        sio = StringIO.StringIO(pg.page)
+        etree = xml.etree.ElementTree.parse(sio).getroot()
+    return etree
+
+def stream(url, args=None, range=None, hide=False):
+    pg = debug('STREAM', url=url, args=args, range=range)
+    if not hasattr(pg, 'page'):
+        _request(pg, url, args, range, hide)
+    return contextlib.closing(pg)
 
 def load_attrdicts(fn):
     try:
@@ -219,9 +310,8 @@ def open_notrunc(name, bufsize=4*1024):
     return os.fdopen(fd, 'wb', bufsize)
 
 def cmd_login(email, passwd):
-    with request(LOGIN, args={'log_email': email,
-                              'log_password': passwd}) as page:
-        etree = parser.parse(page)
+    etree = request(LOGIN, args={'log_email': email,
+                                 'log_password': passwd})
     if etree.find(".//div[@id='register_holder']") is not None:
         # this element is only present if not logged in
         raise RuntimeError('login failed')
@@ -230,10 +320,12 @@ def cmd_login(email, passwd):
 def cmd_manifest():
     games = {}
 
+    # requests up front so we have them all in debug mode
+    list_et = request(LIST)
+    shelf_et = request(SHELF)
+
     # parse game list and available files for each from list page
-    with request(LIST) as page:
-        etree = parser.parse(page)
-    for game in etree.findall(".//div[@class='tab_1_row']"):
+    for game in list_et.findall(".//div[@class='tab_1_row']"):
         gamecard = game.find(".//div[@class='tab_1_title']/a")
         g = AttrDict()
         g.key = gamecard.attrib['href'].split('/')[-1]
@@ -253,9 +345,7 @@ def cmd_manifest():
         games[g.key] = g
 
     # match games to covers on the shelf page
-    with request(SHELF) as page:
-        etree = parser.parse(page)
-    for game in etree.findall(".//div[@class='shelf_item_h']"):
+    for game in shelf_et.findall(".//div[@class='shelf_item_h']"):
         gamecard = game.find(".//div[@class='shelf_ov_tab_2_title']/a")
         if gamecard is not None:
             g = games[gamecard.attrib['href'].split('/')[-1]]
@@ -267,14 +357,13 @@ def cmd_manifest():
     # - the chunk MD5s for setup files (from the corresponding XML)
     for g in games.values():
         for i, f in enumerate(g.setup + g.extra):
-            with request(f.href, range=(0, 0)) as page:
-                f.size = int(page.headers['Content-Range'].split('/')[-1])
-                f.name = urlparse.urlparse(page.geturl()).path.split('/')[-1]
+            with stream(f.href, range=(0, 0)) as page:
+                f.size = int(page.content_range.split('/')[-1])
+                f.name = urlparse.urlparse(page.url_after).path.split('/')[-1]
                 if i < len(g.setup):
-                    f.url = page.geturl()
+                    f.url = page.url_after
         for f in g.setup:
-            with request(f.url.replace('?', '.xml?'), hide=True) as page:
-                etree = xml.etree.ElementTree.parse(page).getroot()
+            etree = request(f.url.replace('?', '.xml?'), html=False, hide=True)
             del f['url']
             assert f.name == etree.attrib['name']
             assert f.size == int(etree.attrib['total_size'])
@@ -298,9 +387,13 @@ def cmd_manifest():
             path = pathmap.get(g.key, g.key)
             ext = os.path.splitext(href)[-1]
             fn = '%s_%s%s' % (g.key, which, ext)
-            with request(href) as page:
+            try:
+                with stream(href) as page:
+                    data = page.read()
                 with open(os.path.join(path, fn), 'wb') as w:
-                    w.write(page.read())
+                    w.write(data)
+            except DebugPage:
+                pass
         for g in games.values():
             fetch('cover', g)
             fetch('thumb', g)
@@ -381,8 +474,8 @@ def cmd_fetch():
                 with open_notrunc(path, 4*1024) as out:
                     out.seek(start)
                     se = start, end
-                    with request(f.href, range=se, hide=True) as page:
-                        hdr = page.headers['Content-Range'].split()[-1]
+                    with stream(f.href, range=se, hide=True) as page:
+                        hdr = page.content_range.split()[-1]
                         assert hdr == '%d-%d/%d' % (start, end, f.size)
                         assert out.tell() == start
                         ioloop(tid, path, page, out)
@@ -391,6 +484,8 @@ def cmd_fetch():
                 with lock:
                     print >>sys.stderr, '!', path
                     errors.setdefault(path, []).append(e)
+            except DebugPage:
+                pass
             work.task_done()
 
     # detailed progress report
@@ -434,17 +529,30 @@ def cmd_fetch():
 def main(args):
     arg0 = sys.argv[0]
 
-    # check for options
-    for opt in args:
-        if not opt.startswith('-'):
-            break
-        if opt == '--help':
-            print __doc__ % arg0
-            return 0
-        if opt == '--version':
-            print 'gog-backup version', __version__
-            return 0
+    class Parser(optparse.OptionParser):
+        def format_epilog(self, formatter):
+            return self.epilog + '\n'
+    usage = __doc__.splitlines()
+    parser = Parser(prog=arg0, usage=usage[0],
+                    epilog='\n'.join(usage[1:]),
+                    version='%prog version ' + __version__)
+    parser.add_option('--debug', action='store', metavar='ZIPFILE',
+                      help='generate a HTTP request log')
+    parser.add_option('--replay', action='store', metavar='ZIPFILE',
+                      help='replay an existing HTTP request log')
+    opts, args = parser.parse_args()
+    if opts.debug and opts.replay:
+        parser.error('options --debug and --replay are mutually exclusive')
 
+    # configure debugging mode
+    global debuglog
+    if opts.debug:
+        debuglog = ([], opts.debug)
+    if opts.replay:
+        debuglog = ({}, None)
+        debug_load(opts.replay)
+
+    # switch to backup directory
     os.chdir(BACKUPINTO)
 
     # load saved cookies, if any
@@ -464,13 +572,17 @@ def main(args):
 
     # dispatch to subcommand handler
     try:
-        globals()['cmd_' + args[0]](*args[1:])
+        debug('INVOCATION', args[0])
     except IndexError:
         print >>sys.stderr, '%s: missing command' % arg0
         return 10
+    try:
+        fn = globals()['cmd_' + args[0]]
     except KeyError:
         print >>sys.stderr, '%s: invalid command %r' % (arg0, args[0])
         return 10
+    try:
+        fn(*args[1:])
     except TypeError, e:
         msg = e.message.replace('cmd_%s()' % args[0], repr(args[0]))
         print >>sys.stderr, '%s: %s' % (arg0, msg)
@@ -482,4 +594,10 @@ def main(args):
     return 0
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception:
+        debug('TRACEBACK', traceback.format_exc())
+        raise
+    finally:
+        debug_save()
