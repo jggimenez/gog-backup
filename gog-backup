@@ -44,7 +44,7 @@ Possible commands:
 """
 
 __author__ = 'Evan Powers'
-__version__ = '1.0'
+__version__ = '1.01'
 __url__ = 'https://github.com/evanpowers/gog-backup'
 
 import sys, os, contextlib, pprint, hashlib, zipfile
@@ -219,7 +219,13 @@ def needed(valid, games, missing, corrupt):
 
 def open_notrunc(name, bufsize=4*1024):
     # 'w+' includes O_TRUNC, 'r+' lacks O_CREAT; so, roll my own
-    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_BINARY, 0666)
+    mode = os.O_WRONLY | os.O_CREAT
+    
+    # O_BINARY is Windows only
+    if hasattr(os, "O_BINARY"):
+        mode |= os.O_BINARY
+    
+    fd = os.open(name, mode, 0666)
     return os.fdopen(fd, 'wb', bufsize)
 
 def cmd_login(email, passwd):
